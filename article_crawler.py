@@ -1,9 +1,11 @@
 import requests
 from bs4 import BeautifulSoup
-from transformers import pipeline
+import torch
+from transformers import pipeline, AutoTokenizer
+import logging
 
-# TODO: split and pipline the article text for long articles handling
-# TODO: try to figure out how to use GPU using cuda for better performance
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 
 def fetch_article(url):
@@ -14,24 +16,58 @@ def fetch_article(url):
         article_text = ' '.join([para.get_text() for para in paragraphs])
         return article_text
     else:
+        logger.error(f"Failed to fetch article, status code: {response.status_code}")
         return None
 
 
+def split_text(text, tokenizer, max_length=1024):
+    tokens = tokenizer(text, return_tensors='pt', truncation=False)['input_ids'][0]
+    chunks = []
+    start = 0
+
+    while start < len(tokens):
+        end = min(start + max_length, len(tokens))
+        chunk_tokens = tokens[start:end]
+        chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+        chunks.append(chunk_text)
+        start = end
+
+    return chunks
+
+
 def summarize_article(article_text):
-    summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
-    summary = summarizer(article_text, max_length=130, min_length=30, do_sample=False)
-    return summary[0]['summary_text']
+    device = 0 if torch.cuda.is_available() else -1  # Use GPU if available, otherwise use CPU
+    summarizer = pipeline("summarization", model="facebook/bart-large-cnn", device=device)
+    tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large-cnn")
+
+    chunks = split_text(article_text, tokenizer)
+
+    for i, chunk in enumerate(chunks):
+        token_count = len(tokenizer(chunk, return_tensors='pt')['input_ids'][0])
+        logger.debug(f"Chunk {i + 1}/{len(chunks)}: {token_count} tokens")
+        if token_count > 1024:
+            logger.warning(f"Chunk {i + 1} exceeds max token length: {token_count} tokens")
+        logger.debug(chunk[:500])  # Log the first 500 characters of the chunk for inspection
+
+    summaries = []
+    for i, chunk in enumerate(chunks):
+        try:
+            summary = summarizer(chunk, max_length=130, min_length=30, do_sample=False)[0]['summary_text']
+            summaries.append(summary)
+        except Exception as e:
+            logger.error(f"Error summarizing chunk {i + 1}: {e}")
+            continue
+
+    return ' '.join(summaries)
 
 
 if __name__ == "__main__":
-    link = input("Enter the URL of the article: ")
-    article = fetch_article(link)
+    url = input("Enter the URL of the article: ")
+    article = fetch_article(url)
     if article:
-        print("Article fetched successfully!")
-        print(article[:500] + "...")  # Print first 500 characters as a sample
-
-        summarization = summarize_article(article)
+        logger.info("Article fetched successfully!")
+        summary = summarize_article(article)
         print("\nSummary:")
-        print(summarization)
+        print(summary)
     else:
-        print("Failed to fetch the article.")
+        logger.error("Failed to fetch the article.")
